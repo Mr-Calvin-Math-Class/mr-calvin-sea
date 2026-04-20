@@ -512,7 +512,7 @@ document.addEventListener('DOMContentLoaded', async function () {
         await getSharedConnection();
 
         if ('serviceWorker' in navigator) {
-            const reg = await navigator.serviceWorker.register(getBasePath() + '/sw.js', { scope: getBasePath() });
+            const reg = await navigator.serviceWorker.register(getBasePath() + 'sw.js', { scope: getBasePath() });
             await navigator.serviceWorker.ready;
             
             const swConfig = {
