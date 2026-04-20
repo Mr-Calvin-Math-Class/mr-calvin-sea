@@ -1,41 +1,25 @@
 // =====================================================
-// CONFIGURATION
+// CONFIGURATION - Gets from config.js
 // =====================================================
-const DEFAULT_WISP = window.SITE_CONFIG?.defaultWisp ?? "wss://military.marincareers.org/wisp/";
-const WISP_SERVERS = [
-    { name: "Wisp Server 1 (Default)", url: "wss://military.marincareers.org/wisp/" },
-    { name: "Wisp Server 2", url: "wss://wisp-deployer--asvasvavd.replit.app/" }
-];
+const DEFAULT_WISP = window.SITE_CONFIG?.defaultWisp ?? "wss://glseries.net/wisp/";
+const WISP_SERVERS = [{ name: "GLSeries", url: "wss://glseries.net/wisp/" }];
 
-const memoryStorage = {};
-function storageGetItem(key) {
-    try {
-        const value = localStorage.getItem(key);
-        return value ?? memoryStorage[key] ?? null;
-    } catch {
-        return memoryStorage[key] ?? null;
-    }
+// Initialize default proxy server if not set
+if (!localStorage.getItem("proxServer")) {
+    localStorage.setItem("proxServer", DEFAULT_WISP);
 }
 
-function storageSetItem(key, value) {
-    memoryStorage[key] = value;
-    try {
-        localStorage.setItem(key, value);
-    } catch {}
-}
-
-if (!storageGetItem("proxServer")) {
-    storageSetItem("proxServer", DEFAULT_WISP);
-}
-
+// Helper to get all servers (config + custom)
 function getAllWispServers() {
     const customWisps = getStoredWisps();
     return [...WISP_SERVERS, ...customWisps];
 }
 
 // =====================================================
-// BULLETPROOF HEALTH & ERROR HANDLING
+// PROACTIVE SERVER HEALTH CHECKING
 // =====================================================
+
+// Ping a wisp server to check if it's responsive
 async function pingWispServer(url, timeout = 2000) {
     return new Promise((resolve) => {
         const start = Date.now();
@@ -45,34 +29,75 @@ async function pingWispServer(url, timeout = 2000) {
                 try { ws.close(); } catch {}
                 resolve({ url, success: false, latency: null });
             }, timeout);
-            ws.onopen = () => { clearTimeout(timer); ws.close(); resolve({ url, success: true, latency: Date.now() - start }); };
-            ws.onerror = () => { clearTimeout(timer); ws.close(); resolve({ url, success: false, latency: null }); };
-        } catch { resolve({ url, success: false, latency: null }); }
+
+            ws.onopen = () => {
+                clearTimeout(timer);
+                const latency = Date.now() - start;
+                try { ws.close(); } catch {}
+                resolve({ url, success: true, latency });
+            };
+
+            ws.onerror = () => {
+                clearTimeout(timer);
+                try { ws.close(); } catch {}
+                resolve({ url, success: false, latency: null });
+            };
+        } catch {
+            resolve({ url, success: false, latency: null });
+        }
     });
 }
 
+// Find the best (fastest working) server from the list
 async function findBestWispServer(servers, currentUrl) {
     if (!servers || servers.length === 0) return currentUrl;
-    const results = await Promise.all(servers.map(s => pingWispServer(s.url, 2000)));
-    const working = results.filter(r => r.success).sort((a, b) => a.latency - b.latency);
-    return working.length > 0 ? working[0].url : currentUrl || servers[0]?.url;
+
+    // Ping all servers in parallel (faster than sequential)
+    const results = await Promise.all(
+        servers.map(s => pingWispServer(s.url, 2000))
+    );
+
+    // Filter to only working servers and sort by latency
+    const working = results
+        .filter(r => r.success)
+        .sort((a, b) => a.latency - b.latency);
+
+    if (working.length > 0) {
+        return working[0].url;
+    }
+
+    // If none working, return current or first
+    return currentUrl || servers[0]?.url;
 }
 
+// Proactively check and switch to best server on init
 async function initializeWithBestServer() {
-    const autoswitch = storageGetItem('wispAutoswitch') !== 'false';
+    const autoswitch = localStorage.getItem('wispAutoswitch') !== 'false';
     const allServers = getAllWispServers();
-    if (!autoswitch || allServers.length <= 1) return;
 
-    const currentUrl = storageGetItem("proxServer") || DEFAULT_WISP;
+    if (!autoswitch || allServers.length <= 1) {
+        return;
+    }
+
+    const currentUrl = localStorage.getItem("proxServer") || DEFAULT_WISP;
+    
+    // Check if current server is working, if not find a better one
     const currentCheck = await pingWispServer(currentUrl, 2000);
     
-    if (!currentCheck.success) {
-        console.log("Current server dead. Finding best server...");
-        const best = await findBestWispServer(allServers, currentUrl);
-        if (best && best !== currentUrl) {
-            storageSetItem("proxServer", best);
-            notify('info', 'Auto-switched', 'Switched to a faster proxy server.');
-        }
+    if (currentCheck.success) {
+        console.log("Init: Current server is working:", currentUrl, currentCheck.latency + "ms");
+        return;
+    }
+
+    // Current server is bad, find the fastest working server
+    console.log("Init: Current server not responding, finding better server...");
+    const best = await findBestWispServer(allServers, currentUrl);
+    
+    if (best && best !== currentUrl) {
+        console.log("Init: Auto-switching to faster server:", best);
+        localStorage.setItem("proxServer", best);
+        const serverName = allServers.find(s => s.url === best)?.name || 'Faster Server';
+        notify('info', 'Auto-switched', `Using ${serverName} for best performance`);
     }
 }
 
@@ -80,30 +105,48 @@ async function initializeWithBestServer() {
 // BROWSER STATE
 // =====================================================
 const BareMux = window.BareMux ?? { BareMuxConnection: class { setTransport() {} } };
+
+// SINGLETON: Shared resources for all tabs (prevents connection exhaustion)
 let sharedScramjet = null;
 let sharedConnection = null;
 let sharedConnectionReady = false;
+
 let tabs = [];
 let activeTabId = null;
 let nextTabId = 1;
 
+// =====================================================
+// UTILITIES
+// =====================================================
 const getBasePath = () => {
     const basePath = location.pathname.replace(/[^/]*$/, '');
     return basePath.endsWith('/') ? basePath : basePath + '/';
 };
-const getStoredWisps = () => { try { return JSON.parse(storageGetItem('customWisps') ?? '[]'); } catch { return []; } };
+
+const getStoredWisps = () => {
+    try { return JSON.parse(localStorage.getItem('customWisps') ?? '[]'); }
+    catch { return []; }
+};
+
 const getActiveTab = () => tabs.find(t => t.id === activeTabId);
-const notify = (type, title, message) => { if (typeof Notify !== 'undefined') Notify[type](title, message); };
+
+const notify = (type, title, message) => {
+    if (typeof Notify !== 'undefined') {
+        Notify[type](title, message);
+    }
+};
 
 // =====================================================
-// INITIALIZATION (With Auto-Nuke for Corruption)
+// INITIALIZATION
 // =====================================================
 async function getSharedScramjet() {
     if (sharedScramjet) return sharedScramjet;
+
+    const basePath = getBasePath();
     const { ScramjetController } = $scramjetLoadController();
     
     sharedScramjet = new ScramjetController({
-        prefix: getBasePath() + "scramjet/",
+        prefix: basePath + "scramjet/",
         files: {
             wasm: "https://cdn.jsdelivr.net/gh/Destroyed12121/Staticsj@main/JS/scramjet.wasm.wasm",
             all: "https://cdn.jsdelivr.net/gh/Destroyed12121/Staticsj@main/JS/scramjet.all.js",
@@ -114,38 +157,45 @@ async function getSharedScramjet() {
     try {
         await sharedScramjet.init();
     } catch (err) {
-        console.warn('Scramjet cache corrupted. Auto-nuking IndexedDB...', err);
-        try {
-            ['scramjet-data', 'scrambase', 'ScramjetData'].forEach(db => indexedDB.deleteDatabase(db));
-        } catch (e) {}
-        sharedScramjet = null;
-        return getSharedScramjet(); // Retry after nuke
+        // Handle IndexedDB schema errors by clearing cache and retrying
+        if (err.message && err.message.includes('IDBDatabase') || err.message && err.message.includes('object stores')) {
+            console.warn('Scramjet IndexedDB error, clearing cache and retrying...');
+            
+            // Clear IndexedDB for Scramjet
+            try {
+                const dbNames = ['scramjet-data', 'scrambase', 'ScramjetData'];
+                for (const dbName of dbNames) {
+                    const req = indexedDB.deleteDatabase(dbName);
+                    req.onsuccess = () => console.log(`Cleared IndexedDB: ${dbName}`);
+                    req.onerror = () => console.warn(`Failed to clear IndexedDB: ${dbName}`);
+                }
+            } catch (clearErr) {
+                console.warn('Failed to clear IndexedDB:', clearErr);
+            }
+            
+            // Reset shared instance and retry
+            sharedScramjet = null;
+            return getSharedScramjet();
+        }
+        throw err;
     }
+    
     return sharedScramjet;
 }
 
 async function getSharedConnection() {
     if (sharedConnectionReady) return sharedConnection;
-    const wispUrl = storageGetItem("proxServer") ?? DEFAULT_WISP;
-    sharedConnection = new BareMux.BareMuxConnection(getBasePath() + "bareworker.js");
+
+    const basePath = getBasePath();
+    const wispUrl = localStorage.getItem("proxServer") ?? DEFAULT_WISP;
     
+    sharedConnection = new BareMux.BareMuxConnection(basePath + "bareworker.js");
     await sharedConnection.setTransport(
-        "https://cdn.jsdelivr.net/gh/Sea-Math/sail@main/libcurl/index.mjs",
+        "https://cdn.jsdelivr.net/npm/@mercuryworkshop/epoxy-transport@2.1.28/dist/index.mjs",
         [{ wisp: wispUrl }]
     );
     sharedConnectionReady = true;
     return sharedConnection;
-}
-
-// Check if SW is alive before navigating
-async function ensureServiceWorker() {
-    if ('serviceWorker' in navigator) {
-        const reg = await navigator.serviceWorker.ready;
-        if (!navigator.serviceWorker.controller) {
-            console.warn("Service Worker asleep! Reloading window to wake it up...");
-            window.location.reload();
-        }
-    }
 }
 
 async function initializeBrowser() {
@@ -176,46 +226,54 @@ async function initializeBrowser() {
                 </div>
                 <div id="error" class="message-container" style="display: none;">
                     <div class="message-content">
-                        <h1><i class="fa-solid fa-triangle-exclamation"></i> Connection Failed</h1>
-                        <p id="error-message">The proxy failed to load this page. It may be blocked or the server is down.</p>
-                        <button id="retry-error-btn" style="margin-top: 15px; padding: 8px 16px; cursor: pointer;">Try Again</button>
+                        <h1>Connection Error</h1>
+                        <p id="error-message">An error occurred.</p>
                     </div>
                 </div>
             </div>
         </div>`;
 
-    document.getElementById('back-btn').onclick = () => getActiveTab()?.frame.back();
-    document.getElementById('fwd-btn').onclick = () => getActiveTab()?.frame.forward();
-    document.getElementById('reload-btn').onclick = () => getActiveTab()?.frame.reload();
+    // Cache DOM elements
+    const elements = {
+        backBtn: document.getElementById('back-btn'),
+        fwdBtn: document.getElementById('fwd-btn'),
+        reloadBtn: document.getElementById('reload-btn'),
+        addrBar: document.getElementById('address-bar'),
+        skipBtn: document.getElementById('skip-btn')
+    };
+
+    // Bind navigation events
+    elements.backBtn.onclick = () => getActiveTab()?.frame.back();
+    elements.fwdBtn.onclick = () => getActiveTab()?.frame.forward();
+    elements.reloadBtn.onclick = () => getActiveTab()?.frame.reload();
     document.getElementById('home-btn-nav').onclick = () => window.location.href = '../index.html';
     document.getElementById('devtools-btn').onclick = toggleDevTools;
     document.getElementById('wisp-settings-btn').onclick = openSettings;
-    
-    document.getElementById('skip-btn').onclick = () => {
+
+    // Skip button logic
+    elements.skipBtn.onclick = () => {
         const tab = getActiveTab();
-        if (tab) { tab.loading = false; showIframeLoading(false); }
-    };
-    
-    document.getElementById('retry-error-btn').onclick = () => {
-        document.getElementById("error").style.display = "none";
-        getActiveTab()?.frame.reload();
+        if (tab) {
+            tab.loading = false;
+            showIframeLoading(false);
+        }
     };
 
-    const addrBar = document.getElementById('address-bar');
-    addrBar.onkeyup = (e) => e.key === 'Enter' && handleSubmit();
-    addrBar.onfocus = () => addrBar.select();
+    // Address bar events
+    elements.addrBar.onkeyup = (e) => e.key === 'Enter' && handleSubmit();
+    elements.addrBar.onfocus = () => elements.addrBar.select();
 
-    window.addEventListener('message', (e) => { if (e.data?.type === 'navigate') handleSubmit(e.data.url); });
+    // Handle navigation messages
+    window.addEventListener('message', (e) => {
+        if (e.data?.type === 'navigate') handleSubmit(e.data.url);
+    });
 
     createTab(true);
-    if (window.location.hash) {
-        handleSubmit(decodeURIComponent(window.location.hash.substring(1)));
-        history.replaceState(null, null, location.pathname);
-    }
+    checkHashParameters();
 }
 
 // =====================================================
-// BULLETPROOF TAB MANAGEMENT
+// TAB MANAGEMENT
 // =====================================================
 function createTab(makeActive = true) {
     const frame = sharedScramjet.createFrame();
@@ -226,7 +284,8 @@ function createTab(makeActive = true) {
         frame,
         loading: false,
         favicon: null,
-        timeoutTracker: null
+        skipTimeout: null,
+        loadStartTime: null
     };
 
     frame.frame.src = "NT.html";
@@ -234,9 +293,11 @@ function createTab(makeActive = true) {
     frame.addEventListener("urlchange", (e) => {
         tab.url = e.url;
         tab.loading = true;
-        document.getElementById("error").style.display = "none";
+        tab.loadStartTime = Date.now();
 
-        if (tab.id === activeTabId) showIframeLoading(true, tab.url);
+        if (tab.id === activeTabId) {
+            showIframeLoading(true, tab.url);
+        }
 
         try {
             const urlObj = new URL(e.url);
@@ -251,49 +312,31 @@ function createTab(makeActive = true) {
         updateAddressBar();
         updateLoadingBar(tab, 10);
 
-        // Kill Switch: If it takes longer than 15 seconds, assume proxy failure.
-        clearTimeout(tab.timeoutTracker);
-        tab.timeoutTracker = setTimeout(() => {
-            if (tab.loading && tab.id === activeTabId && tab.url && !tab.url.includes('NT.html')) {
-                showIframeLoading(false);
-                document.getElementById("error").style.display = "flex";
-                document.getElementById("error-message").textContent = "Connection Timed Out. The server took too long to respond.";
-                tab.loading = false;
-                updateLoadingBar(tab, 100);
+        if (tab.skipTimeout) clearTimeout(tab.skipTimeout);
+        tab.skipTimeout = setTimeout(() => {
+            if (tab.loading && tab.id === activeTabId) {
+                document.getElementById('skip-btn')?.style.setProperty('display', 'inline-block');
             }
-        }, 15000);
+        }, 200);
     });
 
     frame.frame.addEventListener('load', () => {
         tab.loading = false;
-        clearTimeout(tab.timeoutTracker);
+        clearTimeout(tab.skipTimeout);
 
-        if (tab.id === activeTabId) showIframeLoading(false);
+        if (tab.id === activeTabId) {
+            showIframeLoading(false);
+        }
 
-        // --- BULLETPROOF BLANK PAGE DETECTOR ---
-        let isBlank = false;
         try {
-            const frameDoc = frame.frame.contentDocument || frame.frame.contentWindow.document;
-            if (frameDoc && frameDoc.body && frameDoc.body.innerHTML.trim() === "" && tab.url && !tab.url.includes('NT.html')) {
-                isBlank = true;
-            }
-        } catch (e) {
-            // Cross-origin error means it actually loaded successfully!
-            isBlank = false; 
-        }
-
-        if (isBlank && tab.id === activeTabId) {
-            document.getElementById("error").style.display = "flex";
-            document.getElementById("error-message").textContent = "The server returned an empty page. The site might be blocking proxies.";
-        } else if (tab.id === activeTabId) {
-            document.getElementById("error").style.display = "none";
-        }
-        // ---------------------------------------
-
-        try { const title = frame.frame.contentWindow.document.title; if (title) tab.title = title; } catch {}
+            const title = frame.frame.contentWindow.document.title;
+            if (title) tab.title = title;
+        } catch { }
 
         if (frame.frame.contentWindow.location.href.includes('NT.html')) {
-            tab.title = "New Tab"; tab.url = ""; tab.favicon = null;
+            tab.title = "New Tab";
+            tab.url = "";
+            tab.favicon = null;
         }
 
         updateTabsUI();
@@ -310,25 +353,33 @@ function createTab(makeActive = true) {
 function showIframeLoading(show, url = '') {
     const loader = document.getElementById("loading");
     if (!loader) return;
+
     loader.style.display = show ? "flex" : "none";
     getActiveTab()?.frame.frame.classList.toggle('loading', show);
+
     if (show) {
         document.getElementById("loading-title").textContent = "Connecting";
         document.getElementById("loading-url").textContent = url || "Loading content...";
         document.getElementById("skip-btn").style.display = 'none';
-        setTimeout(() => { if (document.getElementById("skip-btn")) document.getElementById("skip-btn").style.display = 'inline-block'; }, 3000);
     }
 }
 
 function switchTab(tabId) {
     activeTabId = tabId;
     const tab = getActiveTab();
-    tabs.forEach(t => t.frame.frame.classList.toggle("hidden", t.id !== tabId));
-    
-    // Clear error UI when switching tabs
-    document.getElementById("error").style.display = "none";
 
-    if (tab) showIframeLoading(tab.loading, tab.url);
+    tabs.forEach(t => t.frame.frame.classList.toggle("hidden", t.id !== tabId));
+
+    if (tab) {
+        showIframeLoading(tab.loading, tab.url);
+        
+        const skipBtn = document.getElementById('skip-btn');
+        if (tab.loading && tab.loadStartTime && skipBtn) {
+            const elapsed = Date.now() - tab.loadStartTime;
+            if (elapsed > 3000) skipBtn.style.display = 'inline-block';
+        }
+    }
+
     updateTabsUI();
     updateAddressBar();
 }
@@ -336,30 +387,48 @@ function switchTab(tabId) {
 function closeTab(tabId) {
     const idx = tabs.findIndex(t => t.id === tabId);
     if (idx === -1) return;
+
     const tab = tabs[idx];
-    clearTimeout(tab.timeoutTracker);
-    if (tab.frame?.frame) { tab.frame.frame.src = 'about:blank'; tab.frame.frame.remove(); }
+    clearTimeout(tab.skipTimeout);
+    
+    if (tab.frame?.frame) {
+        tab.frame.frame.src = 'about:blank';
+        tab.frame.frame.remove();
+    }
+    
     tabs.splice(idx, 1);
+
     if (activeTabId === tabId) {
         if (tabs.length > 0) switchTab(tabs[Math.max(0, idx - 1)].id);
         else window.location.reload();
-    } else { updateTabsUI(); }
+    } else {
+        updateTabsUI();
+    }
 }
 
 function updateTabsUI() {
     const container = document.getElementById("tabs-container");
     container.innerHTML = "";
+
     tabs.forEach(tab => {
         const el = document.createElement("div");
         el.className = `tab ${tab.id === activeTabId ? "active" : ""}`;
-        const iconHtml = tab.loading ? `<div class="tab-spinner"></div>` : tab.favicon ? `<img src="${tab.favicon}" class="tab-favicon" onerror="this.style.display='none'">` : '';
+
+        const iconHtml = tab.loading 
+            ? `<div class="tab-spinner"></div>`
+            : tab.favicon 
+                ? `<img src="${tab.favicon}" class="tab-favicon" onerror="this.style.display='none'">`
+                : '';
+
         el.innerHTML = `${iconHtml}<span class="tab-title">${tab.title}</span><span class="tab-close">&times;</span>`;
         el.onclick = () => switchTab(tab.id);
         el.querySelector(".tab-close").onclick = (e) => { e.stopPropagation(); closeTab(tab.id); };
         container.appendChild(el);
     });
+
     const newBtn = document.createElement("button");
-    newBtn.className = "new-tab"; newBtn.innerHTML = "<i class='fa-solid fa-plus'></i>";
+    newBtn.className = "new-tab";
+    newBtn.innerHTML = "<i class='fa-solid fa-plus'></i>";
     newBtn.onclick = () => createTab(true);
     container.appendChild(newBtn);
 }
@@ -367,21 +436,22 @@ function updateTabsUI() {
 function updateAddressBar() {
     const bar = document.getElementById("address-bar");
     const tab = getActiveTab();
-    if (bar && tab) bar.value = (tab.url && !tab.url.includes("NT.html")) ? tab.url : "";
+    if (bar && tab) {
+        bar.value = (tab.url && !tab.url.includes("NT.html")) ? tab.url : "";
+    }
 }
 
-async function handleSubmit(url) {
-    await ensureServiceWorker(); // Check SW before sending request
+function handleSubmit(url) {
     const tab = getActiveTab();
     let input = url ?? document.getElementById("address-bar").value.trim();
     if (!input) return;
 
     if (!input.startsWith('http')) {
         input = input.includes('.') && !input.includes(' ') 
-            ? `https://${input}` : `https://search.brave.com/search?q=${encodeURIComponent(input)}`;
+            ? `https://${input}`
+            : `https://search.brave.com/search?q=${encodeURIComponent(input)}`;
     }
     
-    document.getElementById("error").style.display = "none";
     tab.loading = true;
     showIframeLoading(true, input);
     updateLoadingBar(tab, 10);
@@ -397,13 +467,15 @@ function updateLoadingBar(tab, percent) {
 }
 
 // =====================================================
-// SETTINGS UI
+// SETTINGS & WISP
 // =====================================================
 function openSettings() {
     const modal = document.getElementById('wisp-settings-modal');
     modal.classList.remove('hidden');
+
     document.getElementById('close-wisp-modal').onclick = () => modal.classList.add('hidden');
     document.getElementById('save-custom-wisp').onclick = saveCustomWisp;
+
     modal.onclick = (e) => { if (e.target === modal) modal.classList.add('hidden'); };
     renderServerList();
 }
@@ -411,137 +483,247 @@ function openSettings() {
 function renderServerList() {
     const list = document.getElementById('server-list');
     list.innerHTML = '';
-    
-    // Add inline styles for vertical scrolling
-    list.style.maxHeight = '300px'; 
-    list.style.overflowY = 'auto';
-    list.style.paddingRight = '5px'; 
 
-    const currentUrl = storageGetItem('proxServer') ?? DEFAULT_WISP;
+    const currentUrl = localStorage.getItem('proxServer') ?? DEFAULT_WISP;
     const allWisps = [...WISP_SERVERS, ...getStoredWisps()];
 
     allWisps.forEach((server, index) => {
         const isActive = server.url === currentUrl;
         const isCustom = index >= WISP_SERVERS.length;
+
         const item = document.createElement('div');
         item.className = `wisp-option ${isActive ? 'active' : ''}`;
-        const deleteBtn = isCustom ? `<button class="delete-wisp-btn" onclick="event.stopPropagation(); deleteCustomWisp('${server.url}')"><i class="fa-solid fa-trash"></i></button>` : '';
+
+        const deleteBtn = isCustom
+            ? `<button class="delete-wisp-btn" onclick="event.stopPropagation(); deleteCustomWisp('${server.url}')"><i class="fa-solid fa-trash"></i></button>`
+            : '';
+
         item.innerHTML = `
             <div class="wisp-option-header">
-                <div class="wisp-option-name">${server.name} ${isActive ? '<i class="fa-solid fa-check" style="margin-left:8px; font-size: 0.7em; color: var(--accent);"></i>' : ''}</div>
-                <div class="server-status"><span class="ping-text">...</span><div class="status-indicator"></div>${deleteBtn}</div>
+                <div class="wisp-option-name">
+                    ${server.name}
+                    ${isActive ? '<i class="fa-solid fa-check" style="margin-left:8px; font-size: 0.7em; color: var(--accent);"></i>' : ''}
+                </div>
+                <div class="server-status">
+                    <span class="ping-text">...</span>
+                    <div class="status-indicator"></div>
+                    ${deleteBtn}
+                </div>
             </div>
             <div class="wisp-option-url">${server.url}</div>
         `;
+
         item.onclick = () => setWisp(server.url);
         list.appendChild(item);
         checkServerHealth(server.url, item);
     });
 
-    const isAutoswitch = storageGetItem('wispAutoswitch') !== 'false';
+    // Add Autoswitch Toggle
+    const isAutoswitch = localStorage.getItem('wispAutoswitch') !== 'false';
     const toggleContainer = document.createElement('div');
     toggleContainer.className = 'wisp-option';
     toggleContainer.style.cssText = 'margin-top: 10px; cursor: default;';
-    toggleContainer.innerHTML = `<div class="wisp-option-header" style="justify-content: space-between;"><div class="wisp-option-name"><i class="fa-solid fa-rotate" style="margin-right:8px"></i> Auto-switch on failure</div><div class="toggle-switch ${isAutoswitch ? 'active' : ''}" id="autoswitch-toggle"><div class="toggle-knob"></div></div></div>`;
+    toggleContainer.innerHTML = `
+        <div class="wisp-option-header" style="justify-content: space-between;">
+            <div class="wisp-option-name"><i class="fa-solid fa-rotate" style="margin-right:8px"></i> Auto-switch on failure</div>
+            <div class="toggle-switch ${isAutoswitch ? 'active' : ''}" id="autoswitch-toggle">
+                <div class="toggle-knob"></div>
+            </div>
+        </div>
+    `;
+
     toggleContainer.onclick = () => {
         const newState = !isAutoswitch;
-        storageSetItem('wispAutoswitch', String(newState));
+        localStorage.setItem('wispAutoswitch', newState);
         document.getElementById('autoswitch-toggle').classList.toggle('active', newState);
+
         navigator.serviceWorker.controller?.postMessage({ type: 'config', autoswitch: newState });
+        notify('success', 'Settings Saved', `Autoswitch ${newState ? 'Enabled' : 'Disabled'}`);
+        location.reload();
     };
+
     list.appendChild(toggleContainer);
 }
 
 function saveCustomWisp() {
     const input = document.getElementById('custom-wisp-input');
     const url = input.value.trim();
+
     if (!url) return;
-    if (!url.startsWith('ws://') && !url.startsWith('wss://')) return notify('error', 'Invalid URL', 'URL must start with wss:// or ws://');
-    
+    if (!url.startsWith('ws://') && !url.startsWith('wss://')) {
+        notify('error', 'Invalid URL', 'URL must start with wss:// or ws://');
+        return;
+    }
+
     const customWisps = getStoredWisps();
-    if (customWisps.some(w => w.url === url) || WISP_SERVERS.some(w => w.url === url)) return notify('warning', 'Already Exists', 'Server already exists.');
+    if (customWisps.some(w => w.url === url) || WISP_SERVERS.some(w => w.url === url)) {
+        notify('warning', 'Already Exists', 'This server is already in the list.');
+        return;
+    }
+
+    const newServer = { name: `Custom ${customWisps.length + 1}`, url };
+    customWisps.push(newServer);
+    localStorage.setItem('customWisps', JSON.stringify(customWisps));
     
-    customWisps.push({ name: `Custom ${customWisps.length + 1}`, url });
-    storageSetItem('customWisps', JSON.stringify(customWisps));
+    // Switch to the newly added server
     setWisp(url);
+    
     input.value = '';
 }
 
 window.deleteCustomWisp = function (urlToDelete) {
     if (!confirm("Remove this server?")) return;
-    storageSetItem('customWisps', JSON.stringify(getStoredWisps().filter(w => w.url !== urlToDelete)));
-    if (storageGetItem('proxServer') === urlToDelete) setWisp(DEFAULT_WISP); else renderServerList();
+
+    let customWisps = getStoredWisps().filter(w => w.url !== urlToDelete);
+    localStorage.setItem('customWisps', JSON.stringify(customWisps));
+
+    if (localStorage.getItem('proxServer') === urlToDelete) {
+        setWisp(DEFAULT_WISP);
+    } else {
+        renderServerList();
+    }
 };
 
 async function checkServerHealth(url, element) {
     const dot = element.querySelector('.status-indicator');
     const text = element.querySelector('.ping-text');
-    const res = await pingWispServer(url, 2000);
-    if (res.success) {
-        dot.classList.add('status-success');
-        text.textContent = `${res.latency}ms`;
-    } else {
+    const start = Date.now();
+
+    const markOffline = () => {
         dot.classList.add('status-error');
         text.textContent = "Offline";
+    };
+
+    try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 2000);
+        
+        await fetch(url.replace('wss://', 'https://').replace('/wisp/', '/health') || url, {
+            method: 'HEAD',
+            signal: controller.signal,
+            mode: 'no-cors'
+        });
+        
+        clearTimeout(timeout);
+        dot.classList.add('status-success');
+        text.textContent = `${Date.now() - start}ms`;
+    } catch {
+        // Fallback: quick WebSocket test
+        try {
+            const wsTest = new WebSocket(url);
+            wsTest.onopen = () => {
+                dot.classList.add('status-success');
+                text.textContent = `${Date.now() - start}ms`;
+                wsTest.close();
+            };
+            wsTest.onerror = markOffline;
+            
+            setTimeout(() => {
+                if (wsTest.readyState !== WebSocket.OPEN) {
+                    wsTest.close();
+                    markOffline();
+                }
+            }, 1000);
+        } catch { markOffline(); }
     }
 }
 
 function setWisp(url) {
-    storageSetItem('proxServer', url);
+    const oldUrl = localStorage.getItem('proxServer');
+    localStorage.setItem('proxServer', url);
+
+    if (oldUrl !== url) {
+        const serverName = [...WISP_SERVERS, ...getStoredWisps()].find(s => s.url === url)?.name ?? 'Custom Server';
+        notify('success', 'Proxy Changed', `Switching to ${serverName}...`);
+    }
+
     navigator.serviceWorker.controller?.postMessage({ type: 'config', wispurl: url });
     setTimeout(() => location.reload(), 600);
 }
 
+// =====================================================
+// UTILITIES
+// =====================================================
 function toggleDevTools() {
     const win = getActiveTab()?.frame.frame.contentWindow;
     if (!win) return;
-    if (win.eruda) { win.eruda.show(); return; }
+    if (win.eruda) {
+        win.eruda.show();
+        return;
+    }
     const script = win.document.createElement('script');
     script.src = "https://cdn.jsdelivr.net/npm/eruda";
     script.onload = () => { win.eruda.init(); win.eruda.show(); };
     win.document.body.appendChild(script);
 }
 
+async function checkHashParameters() {
+    if (window.location.hash) {
+        const hash = decodeURIComponent(window.location.hash.substring(1));
+        if (hash) handleSubmit(hash);
+        history.replaceState(null, null, location.pathname);
+    }
+}
+
 // =====================================================
-// MASTER BOOT SEQUENCE
+// MAIN INITIALIZATION
 // =====================================================
 document.addEventListener('DOMContentLoaded', async function () {
     try {
+        // Proactively find the best server before initializing
         await initializeWithBestServer();
+        
         await getSharedScramjet();
         await getSharedConnection();
 
         if ('serviceWorker' in navigator) {
-            const reg = await navigator.serviceWorker.register(getBasePath() + 'sws.js', { scope: getBasePath() });
+            const reg = await navigator.serviceWorker.register(getBasePath() + 'sw.js', { scope: getBasePath() });
+            
+            // Wait for SW to be ready
             await navigator.serviceWorker.ready;
+            
+            const wispUrl = localStorage.getItem("proxServer") ?? DEFAULT_WISP;
+            const allServers = getAllWispServers();
+            const autoswitch = localStorage.getItem('wispAutoswitch') !== 'false';
             
             const swConfig = {
                 type: "config",
-                wispurl: storageGetItem("proxServer") ?? DEFAULT_WISP,
-                servers: getAllWispServers(),
-                autoswitch: storageGetItem('wispAutoswitch') !== 'false'
+                wispurl: wispUrl,
+                servers: allServers,
+                autoswitch: autoswitch
             };
 
-            const sendConfig = () => {
+            // Send config to SW
+            const sendConfig = async () => {
                 const sw = reg.active || navigator.serviceWorker.controller;
-                if (sw) sw.postMessage(swConfig);
+                if (sw) {
+                    console.log("Sending config to SW:", swConfig);
+                    sw.postMessage(swConfig);
+                }
             };
+
+            // Try sending immediately, then retry if needed
             sendConfig();
-            setTimeout(sendConfig, 1000); // Failsafe SW ping
+            setTimeout(sendConfig, 500);
+            setTimeout(sendConfig, 1500);
+
+            navigator.serviceWorker.addEventListener('message', (event) => {
+                const { type, url, name, message } = event.data;
+                if (type === 'wispChanged') {
+                    console.log("SW reported Wisp Change:", event.data);
+                    localStorage.setItem("proxServer", url);
+                    notify('info', 'Autoswitched Proxy', `Now using ${name} because the previous server was slow or offline.`);
+                } else if (type === 'wispError') {
+                    console.error("SW reported Wisp Error:", event.data);
+                    notify('error', 'Proxy Error', message);
+                }
+            });
+
+            reg.update();
         }
+
         await initializeBrowser();
     } catch (err) {
         console.error("Initialization error:", err);
-        const root = document.getElementById("app");
-        if (root) {
-            root.innerHTML = `
-                <div class="message-container" style="display:flex;">
-                    <div class="message-content">
-                        <h1><i class="fa-solid fa-triangle-exclamation"></i> Initialization Failed</h1>
-                        <p>Your network or account policy may be blocking required browser storage or scripts.</p>
-                        <button onclick="location.reload()" style="margin-top:12px;padding:8px 14px;cursor:pointer;">Reload</button>
-                    </div>
-                </div>`;
-        }
     }
 });
